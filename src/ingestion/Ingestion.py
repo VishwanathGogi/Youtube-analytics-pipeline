@@ -1,95 +1,86 @@
-# -------------------------------------------------------------------
-# PROJECT     : YouTube Trending Analytics Platform
-# MODULE      : Lambda - Category Metadata Normalization
-# PURPOSE     : Clean and flatten raw JSON ingested into the S3 raw zone.
-#               Convert nested structures into tabular records and write
-#               optimized Parquet outputs into the cleansed zone.
-# RUNTIME     : AWS Lambda (Serverless ETL)
-# AUTHOR      : Vishwanath Gogi
-# -------------------------------------------------------------------
+"""Normalize YouTube category metadata from raw S3 JSON into Parquet."""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any
+from urllib.parse import unquote_plus
 
 import awswrangler as wr
 import pandas as pd
-import urllib.parse
-import os
 
-# -------------------------------------------------------------------
-# Environment variables passed from Lambda configuration.
-# These allow the function to be deployed across multiple environments
-# (dvt, qa, prod) without modifying the code.
-# -------------------------------------------------------------------
-S3_CLEANSED_PATH = os.environ['s3_cleansed_layer']
-GLUE_DB_NAME     = os.environ['glue_catalog_db_name']
-GLUE_TABLE_NAME  = os.environ['glue_catalog_table_name']
-WRITE_MODE       = os.environ['write_data_operation']
+LOGGER = logging.getLogger(__name__)
+LOGGER.setLevel(logging.INFO)
 
 
-def lambda_handler(event, context):
-    """
-    Lambda entry point.
+def _required_env(primary: str, legacy: str | None = None) -> str:
+    """Return a required environment value, supporting one legacy name."""
+    value = os.getenv(primary)
+    if value is None and legacy:
+        value = os.getenv(legacy)
+    if not value:
+        names = f"{primary} or {legacy}" if legacy else primary
+        raise RuntimeError(f"Missing required environment variable: {names}")
+    return value
 
-    Trigger:
-        • S3 PUT event on the raw data bucket for category JSON files.
 
-    Responsibilities:
-        1. Read raw nested JSON from S3.
-        2. Extract and flatten the 'items' array.
-        3. Write normalized data to S3 in Parquet format.
-        4. Update AWS Glue Catalog for downstream Athena consumption.
+S3_CLEANSED_PATH = _required_env("S3_CLEANSED_PATH", "s3_cleansed_layer")
+GLUE_DB_NAME = _required_env("GLUE_DB_NAME", "glue_catalog_db_name")
+GLUE_TABLE_NAME = _required_env("GLUE_TABLE_NAME", "glue_catalog_table_name")
+WRITE_MODE = os.getenv("WRITE_MODE", os.getenv("write_data_operation", "overwrite"))
+ALLOWED_SOURCE_BUCKET = os.getenv("ALLOWED_SOURCE_BUCKET")
 
-    This function acts as the cleansing layer for category metadata.
-    """
 
-    # -------------------------------------------------------------------
-    # Extract bucket name and file key from S3 trigger event.
-    # -------------------------------------------------------------------
-    bucket = event['Records'][0]['s3']['bucket']['name']
-    key    = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+def _source_from_event(event: dict[str, Any]) -> tuple[str, str]:
+    """Extract and validate the source bucket and key from an S3 event."""
+    try:
+        record = event["Records"][0]
+        bucket = record["s3"]["bucket"]["name"]
+        key = unquote_plus(record["s3"]["object"]["key"], encoding="utf-8")
+    except (KeyError, IndexError, TypeError) as exc:
+        raise ValueError("Expected an S3 object-created event") from exc
+
+    if ALLOWED_SOURCE_BUCKET and bucket != ALLOWED_SOURCE_BUCKET:
+        raise ValueError(f"Unexpected source bucket: {bucket}")
+    if not key.lower().endswith(".json"):
+        raise ValueError(f"Unsupported source object type: {key}")
+
+    return bucket, key
+
+
+def lambda_handler(event: dict[str, Any], context: Any) -> dict[str, Any]:
+    """Process one category JSON object referenced by an S3 event."""
+    bucket, key = _source_from_event(event)
+    source_uri = f"s3://{bucket}/{key}"
+
+    LOGGER.info("Processing category metadata", extra={"bucket": bucket, "key": key})
 
     try:
-        # -------------------------------------------------------------------
-        # STEP 1: Read raw JSON from S3.
-        #         Example structure:
-        #         {
-        #             "kind": "...",
-        #             "items": [
-        #                 {"id": "1", "snippet": {...}},
-        #                 ...
-        #             ]
-        #         }
-        # -------------------------------------------------------------------
-        df_raw = wr.s3.read_json(f's3://{bucket}/{key}')
+        raw_frame = wr.s3.read_json(source_uri)
+        if "items" not in raw_frame.columns:
+            raise ValueError(f"Source object does not contain an items field: {key}")
 
-        # -------------------------------------------------------------------
-        # STEP 2: Normalize nested payload.
-        #         Flatten only the 'items' array, which contains the
-        #         category-level metadata required for analytics.
-        # -------------------------------------------------------------------
-        df_flat = pd.json_normalize(df_raw['items'])
+        flattened = pd.json_normalize(raw_frame["items"].explode().dropna())
+        if flattened.empty:
+            raise ValueError(f"Source object contains no category records: {key}")
 
-        # -------------------------------------------------------------------
-        # STEP 3: Write normalized output to S3 as Parquet.
-        #         • Partition-aware
-        #         • Glue Catalog integrated
-        #         • Supports append/overwrite based on WRITE_MODE
-        # -------------------------------------------------------------------
-        write_response = wr.s3.to_parquet(
-            df=df_flat,
+        result = wr.s3.to_parquet(
+            df=flattened,
             path=S3_CLEANSED_PATH,
             dataset=True,
             database=GLUE_DB_NAME,
             table=GLUE_TABLE_NAME,
-            mode=WRITE_MODE
+            mode=WRITE_MODE,
         )
-
-        # Return metadata for observability pipelines
-        return write_response
-
-    except Exception as e:
-        # -------------------------------------------------------------------
-        # Structured error logging. Output captured by CloudWatch Logs.
-        # Helps debug file-level data issues or schema mismatches.
-        # -------------------------------------------------------------------
-        print(f"Exception encountered while processing {key} from bucket {bucket}")
-        print(e)
-        raise e
+        LOGGER.info(
+            "Category metadata processed",
+            extra={"bucket": bucket, "key": key, "rows": len(flattened)},
+        )
+        return result
+    except Exception:
+        LOGGER.exception(
+            "Category metadata processing failed",
+            extra={"bucket": bucket, "key": key},
+        )
+        raise
